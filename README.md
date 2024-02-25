@@ -1,4 +1,8 @@
-# pyVoIP
+# pyVoIP-cancel-fb
+***
+The original pyVoIP library v1.6.8 was modified to work with a AVM FritzBox as SIP server. Furthermore the ability to send cancel requests was implemented. These are the changes by @chris-heo which were proposed [here](https://github.com/tayler6000/pyVoIP/issues/177). Thanks a lot!
+***
+
 PyVoIP is a pure python VoIP/SIP/RTP library.  Currently, it supports PCMA, PCMU, and telephone-event.
 
 This library does not depend on a sound library, i.e. you can use any sound library that can handle linear sound data i.e. pyaudio or even wave.  Keep in mind PCMU/PCMA only supports 8000Hz, 1 channel, 8 bit audio.
