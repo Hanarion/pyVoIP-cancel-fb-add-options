@@ -904,10 +904,24 @@ class SIPClient:
                 if self.callCallback is not None:
                     self.callCallback(message)
             elif (
+                message.status == SIPStatus.BUSY_HERE
+                or message.status == SIPStatus.DECLINE
+            ):
+                message.status = SIPStatus.SERVICE_UNAVAILABLE # results in CallState.ENDED
+                # TODO: Create own mappings and CallStates for BUSY_HERE and DECLINE
+                if self.callCallback is not None:
+                    self.callCallback(message)
+            elif (
                 message.status == SIPStatus.TRYING
                 or message.status == SIPStatus.RINGING
+                or message.status == SIPStatus.SESSION_PROGRESS
             ):
                 pass
+            elif message.status == SIPStatus.REQUEST_TERMINATED:
+                response = self.gen_ack(message)
+                self.out.sendto(
+                    response.encode("utf8"), (self.server, self.port)
+                )
             else:
                 debug(
                     "TODO: Add 500 Error on Receiving SIP Response:\r\n"
@@ -1074,17 +1088,27 @@ class SIPClient:
         )
         return self.gen_authorization(request)
 
-    def gen_authorization(self, request: SIPMessage) -> bytes:
+    def gen_authorization(self, request: SIPMessage, number=None) -> bytes:
         realm = request.authentication["realm"]
         HA1 = self.username + ":" + realm + ":" + self.password
         HA1 = hashlib.md5(HA1.encode("utf8")).hexdigest()
-        HA2 = (
-            ""
-            + request.headers["CSeq"]["method"]
-            + ":sip:"
-            + self.server
-            + ";transport=UDP"
-        )
+        if number is None:
+            HA2 = (
+                ""
+                + request.headers["CSeq"]["method"]
+                + ":sip:"
+                + self.server
+                + ";transport=UDP"
+            )
+        else:
+            HA2 = (
+                ""
+                + request.headers["CSeq"]["method"]
+                + ":sip:"
+                + number
+                + "@"
+                + self.server
+            )
         HA2 = hashlib.md5(HA2.encode("utf8")).hexdigest()
         nonce = request.authentication["nonce"]
         response = (HA1 + ":" + nonce + ":" + HA2).encode("utf8")
@@ -1494,7 +1518,8 @@ class SIPClient:
             + f"<sip:{self.username}@{self.myIP}:{self.myPort}>\r\n"
         )
         invRequest += f"To: <sip:{number}@{self.server}>\r\n"
-        invRequest += f"From: <sip:{self.username}@{self.myIP}>;tag={tag}\r\n"
+        #invRequest += f"From: <sip:{self.username}@{self.myIP}>;tag={tag}\r\n"
+        invRequest += f"From: <sip:{self.username}@{self.server}>;tag={tag}\r\n"
         invRequest += f"Call-ID: {call_id}\r\n"
         invRequest += f"CSeq: {self.inviteCounter.next()} INVITE\r\n"
         invRequest += f"Allow: {(', '.join(pyVoIP.SIPCompatibleMethods))}\r\n"
@@ -1546,6 +1571,40 @@ class SIPClient:
         byeRequest += "Content-Length: 0\r\n\r\n"
 
         return byeRequest
+    
+    def gen_cancel(self, request: SIPMessage) -> str:
+        tag = self.tagLibrary[request.headers["Call-ID"]]
+        c = request.headers["Contact"].strip("<").strip(">")
+        #FIXME: not exactly sure if request.authentication['uri'] is the right token here:
+        cancelRequest = f"CANCEL {request.authentication['uri']} SIP/2.0\r\n"
+        cancelRequest += self._gen_response_via_header(request)
+        cancelRequest += "Max-Forwards: 70\r\n"
+        fromH = request.headers["From"]["raw"]
+        toH = request.headers["To"]["raw"]
+        if request.headers["From"]["tag"] == tag:
+            cancelRequest += f"From: {fromH};tag={tag}\r\n"
+            if request.headers["To"]["tag"] != "":
+                to = toH + ";tag=" + request.headers["To"]["tag"]
+            else:
+                to = toH
+            cancelRequest += f"To: {to}\r\n"
+        else:
+            cancelRequest += (
+                f"To: {fromH};tag=" + f"{request.headers['From']['tag']}\r\n"
+            )
+            cancelRequest += f"From: {toH};tag={tag}\r\n"
+        cancelRequest += f"Call-ID: {request.headers['Call-ID']}\r\n"
+        cseq = int(request.headers["CSeq"]["check"]) #+ 1
+        cancelRequest += f"CSeq: {cseq} CANCEL\r\n"
+        #FIXME: unsure if we need "contact" header
+        #cancelRequest += (
+        #    "Contact: "
+        #    + f"<sip:{self.username}@{self.myIP}:{self.myPort}>\r\n"
+        #)
+        cancelRequest += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
+        cancelRequest += "Content-Length: 0\r\n\r\n"
+
+        return cancelRequest
 
     def genAck(self, request: SIPMessage) -> str:
         warnings.warn(
@@ -1629,15 +1688,19 @@ class SIPClient:
             ack = self.gen_ack(response)
             self.out.sendto(ack.encode("utf8"), (self.server, self.port))
             debug("Acknowledged")
-            authhash = self.gen_authorization(response)
+            authhash = self.gen_authorization(response, number=number)
             nonce = response.authentication["nonce"]
             realm = response.authentication["realm"]
             auth = (
                 f'Authorization: Digest username="{self.username}",realm='
-                + f'"{realm}",nonce="{nonce}",uri="sip:{self.server};'
-                + f'transport=UDP",response="{str(authhash, "utf8")}",'
+                + f'"{realm}",nonce="{nonce}",uri="sip:{number}@{self.server}'
+                + f'",response="{str(authhash, "utf8")}",'
                 + "algorithm=MD5\r\n"
             )
+
+            rindex = -5 # increment the hex digit at this position to get a slightly different branch id
+            h = (int(branch[rindex],16) + 1) & 15
+            branch = branch[0:rindex] + f'{h:x}' + branch[rindex+1:]
 
             invite = self.gen_invite(
                 number, str(sess_id), ms, sendtype, branch, call_id
@@ -1650,6 +1713,10 @@ class SIPClient:
 
             return SIPMessage(invite.encode("utf8")), call_id, sess_id
 
+    def cancel(self, request: SIPMessage) -> None:
+        message = self.gen_cancel(request)
+        self.out.sendto(message.encode("utf8"), (self.server, self.port))
+    
     def bye(self, request: SIPMessage) -> None:
         message = self.gen_bye(request)
         # TODO: Handle bye to server vs. bye to connected client
